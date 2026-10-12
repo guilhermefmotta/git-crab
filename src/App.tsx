@@ -8,8 +8,12 @@ import { CommitGraph } from "@/components/graph/CommitGraph";
 import { DetailPanel } from "@/components/layout/DetailPanel";
 import { WelcomeScreen } from "@/components/dialogs/WelcomeScreen";
 import { SettingsDialog } from "@/components/dialogs/SettingsDialog";
+import { QuickOpenDialog } from "@/components/dialogs/QuickOpenDialog";
+import { SearchDialog } from "@/components/dialogs/SearchDialog";
 import { MergeWorkspace } from "@/components/merge/MergeWorkspace";
 import { useStatus } from "@/hooks/useStatus";
+import { useRepo } from "@/hooks/useRepo";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { git } from "@/lib/tauri";
 import type { RepoStatus } from "@/lib/mergeTypes";
 import { AlertTriangle } from "lucide-react";
@@ -77,7 +81,10 @@ function ResizeDivider({ onDelta, testId }: { onDelta: (dx: number) => void; tes
 export default function App() {
   const { activeRepo, settings, setSelectedCommitHash, status: fileStatus } = useAppStore();
   const { refresh: refreshFileStatus } = useStatus();
+  const { openRepoPaths } = useRepo();
   const [settingsOpen, setSettingsOpen]   = useState(false);
+  const [quickOpen, setQuickOpen]         = useState(false);
+  const [searchOpen, setSearchOpen]       = useState(false);
   const [mergeStatus, setMergeStatus]     = useState<RepoStatus | null>(null);
   const [showResolver, setShowResolver]   = useState(false);
   const [sidebarWidth, setSidebarWidth]   = useState(240);
@@ -102,10 +109,24 @@ export default function App() {
   useEffect(() => { setShowResolver(false); refreshMergeStatus(); }, [activeRepo?.path]);
   useEffect(() => { if (activeRepo) refreshMergeStatus(); }, [fileStatus]);
 
+  // Dropping folders onto the window opens every one of them as a tab
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "drop") openRepoPaths(event.payload.paths);
+      })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; });
+    return () => { cancelled = true; unlisten?.(); };
+  }, [openRepoPaths]);
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key === ",") { e.preventDefault(); setSettingsOpen(true); return; }
+      if (mod && e.shiftKey && e.key.toLowerCase() === "f") { e.preventDefault(); setSearchOpen(true); return; }
+      if (mod && e.key.toLowerCase() === "p") { e.preventDefault(); setQuickOpen(true); return; }
       if (mod && e.key === "f") {
         e.preventDefault();
         (document.getElementById("commit-search") as HTMLInputElement | null)?.focus();
@@ -178,6 +199,9 @@ export default function App() {
       )}
 
       <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <QuickOpenDialog open={quickOpen && !!activeRepo} onClose={() => setQuickOpen(false)} />
+      {/* Mounted only while open: its branch/status/commit hooks load data on mount */}
+      {searchOpen && activeRepo && <SearchDialog open onClose={() => setSearchOpen(false)} />}
       <Toaster position="bottom-right" theme={settings.theme} toastOptions={toastOpts} />
     </div>
   );

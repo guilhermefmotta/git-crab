@@ -8,6 +8,7 @@ import type {
   RemoteInfo,
   StashInfo,
   TagInfo,
+  SearchResult,
 } from "./types";
 import type { RepoStatus, ConflictContent, MergeOutcome, CheckoutOutcome } from "./mergeTypes";
 
@@ -151,12 +152,20 @@ export const git = {
     invoke<void>("open_file_history_window", { key, title }),
   openBlameWindow: (key: string, title: string) =>
     invoke<void>("open_blame_window", { key, title }),
+  openEditorWindow: (key: string, title: string) =>
+    invoke<void>("open_editor_window", { key, title }),
   openMergeWindow: (repoPath: string) =>
     invoke<void>("open_merge_window", { repoPath }),
 
   // File operations
   ignoreFile: (repoPath: string, filePath: string) =>
     invoke<void>("ignore_file", { repoPath, filePath }),
+  listRepoFiles: (repoPath: string) =>
+    invoke<string[]>("list_repo_files", { repoPath }),
+  getFileAtRef: (repoPath: string, rev: string, filePath: string) =>
+    invoke<string>("get_file_at_ref", { repoPath, rev, filePath }),
+  searchText: (repoPath: string, query: string, rev?: string, caseSensitive?: boolean) =>
+    invoke<SearchResult>("search_text", { repoPath, query, rev, caseSensitive }),
   getFileContent: (repoPath: string, filePath: string) =>
     invoke<string>("get_file_content", { repoPath, filePath }),
   writeFileContent: (repoPath: string, filePath: string, content: string) =>

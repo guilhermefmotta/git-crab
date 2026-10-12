@@ -35,6 +35,9 @@ export function CommitDetail({ commit }: { commit: CommitInfo }) {
           commitHash: commit.hash,
         });
         setDiff(result);
+        // Rendering every file of a large commit at once freezes the webview,
+        // so show one file at a time, starting with the first
+        setSelectedFilePath(result[0]?.path ?? null);
       } catch {
         setDiff([]);
       } finally {
@@ -95,7 +98,7 @@ export function CommitDetail({ commit }: { commit: CommitInfo }) {
                 <ContextMenuTrigger asChild>
                   <div
                     data-testid={`commit-file-${f.path.replace(/\//g, "-")}`}
-                    onClick={() => setSelectedFilePath(f.path === selectedFilePath ? null : f.path)}
+                    onClick={() => setSelectedFilePath(f.path)}
                     onDoubleClick={() => {
                       if (!activeRepo) return;
                       const key = `commit_${commit.hash}_${f.path.replace(/[^a-zA-Z0-9_\-]/g, "_")}`;
@@ -163,7 +166,7 @@ export function CommitDetail({ commit }: { commit: CommitInfo }) {
       {/* Diff view */}
       <div className="flex-1 overflow-hidden">
         <DiffViewer
-          diff={selectedFilePath ? diff.filter((f) => f.path === selectedFilePath) : diff}
+          diff={diff.filter((f) => f.path === selectedFilePath)}
           loading={loadingDiff}
         />
       </div>

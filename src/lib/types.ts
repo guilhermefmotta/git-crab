@@ -113,3 +113,19 @@ export interface BlameLine {
   timestamp: number;
   content: string;
 }
+
+export interface SearchMatch {
+  path: string;
+  /** 1-based */
+  line: number;
+  /** UTF-16 offsets of the match inside `text` */
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface SearchResult {
+  matches: SearchMatch[];
+  files_searched: number;
+  truncated: boolean;
+}

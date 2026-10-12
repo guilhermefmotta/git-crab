@@ -12,3 +12,4 @@ pub mod tag;
 pub mod rebase;
 pub mod blame;
 pub mod submodule;
+pub mod search;

@@ -60,6 +60,16 @@ fn parse_diff(diff: git2::Diff) -> Result<Vec<FileDiff>, String> {
     Ok(files)
 }
 
+/// Diffs show each file in full (changes highlighted inline) instead of only
+/// the changed hunks, so the viewer gets one hunk spanning every line.
+fn apply_file_opts(opts: &mut git2::DiffOptions, file_path: Option<&str>) {
+    if let Some(path) = file_path {
+        opts.pathspec(path);
+    }
+    opts.context_lines(1_000_000);
+    opts.interhunk_lines(1_000_000);
+}
+
 #[tauri::command]
 pub async fn get_diff(
     repo_path: String,
@@ -79,9 +89,7 @@ pub async fn get_diff(
             .and_then(|p| p.tree().ok());
 
         let mut opts = git2::DiffOptions::new();
-        if let Some(path) = &file_path {
-            opts.pathspec(path);
-        }
+        apply_file_opts(&mut opts, file_path.as_deref());
 
         repo.diff_tree_to_tree(
             parent_tree.as_ref(),
@@ -96,17 +104,13 @@ pub async fn get_diff(
             .and_then(|h| h.peel_to_tree().ok());
 
         let mut opts = git2::DiffOptions::new();
-        if let Some(path) = &file_path {
-            opts.pathspec(path);
-        }
+        apply_file_opts(&mut opts, file_path.as_deref());
 
         repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
             .map_err(|e| e.message().to_string())?
     } else {
         let mut opts = git2::DiffOptions::new();
-        if let Some(path) = &file_path {
-            opts.pathspec(path);
-        }
+        apply_file_opts(&mut opts, file_path.as_deref());
         repo.diff_index_to_workdir(None, Some(&mut opts))
             .map_err(|e| e.message().to_string())?
     };

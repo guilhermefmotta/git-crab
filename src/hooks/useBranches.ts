@@ -133,7 +133,7 @@ export function useBranches() {
 
   return {
     branches, local, remote, currentBranch,
-    refresh, checkout, smartCheckout, mergeBranch, rebaseBranch,
+    refresh, refreshHead, checkout, smartCheckout, mergeBranch, rebaseBranch,
     createBranch, deleteBranch,
   };
 }

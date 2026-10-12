@@ -281,6 +281,110 @@ pub async fn open_blame_window(
 }
 
 #[tauri::command]
+pub async fn open_editor_window(
+    app: tauri::AppHandle,
+    key: String,
+    title: String,
+) -> Result<(), String> {
+    // Hash the whole key: truncating it would make files that share a long
+    // path prefix collide on the same window
+    let label = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        format!("editor-{:016x}", h.finish())
+    };
+
+    if let Some(win) = app.get_webview_window(&label) {
+        win.set_focus().ok();
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App(
+            std::path::PathBuf::from(format!("index.html?view=editor&key={}", key)),
+        ),
+    )
+    .title(title)
+    .inner_size(1100.0, 800.0)
+    .center()
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Every file in the working tree that git cares about: tracked files still on
+/// disk plus untracked files that aren't ignored. Paths are repo-relative.
+pub fn workdir_files(repo: &Repository) -> Result<Vec<String>, String> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| "Bare repository has no working tree".to_string())?
+        .to_path_buf();
+
+    let mut files = std::collections::BTreeSet::new();
+
+    let index = repo.index().map_err(|e| e.message().to_string())?;
+    for entry in index.iter() {
+        if let Ok(path) = std::str::from_utf8(&entry.path) {
+            if workdir.join(path).is_file() {
+                files.insert(path.to_string());
+            }
+        }
+    }
+
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .map_err(|e| e.message().to_string())?;
+    for entry in statuses.iter() {
+        if entry.status().contains(git2::Status::WT_NEW) {
+            if let Some(path) = entry.path() {
+                files.insert(path.to_string());
+            }
+        }
+    }
+
+    Ok(files.into_iter().collect())
+}
+
+#[tauri::command]
+pub async fn list_repo_files(repo_path: String) -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        let repo = Repository::open(&repo_path).map_err(|e| e.message().to_string())?;
+        workdir_files(&repo)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// File content as of a branch/ref, read from the object database (no checkout).
+#[tauri::command]
+pub async fn get_file_at_ref(
+    repo_path: String,
+    rev: String,
+    file_path: String,
+) -> Result<String, String> {
+    let repo = Repository::open(&repo_path).map_err(|e| e.message().to_string())?;
+    let tree = repo
+        .revparse_single(&rev)
+        .and_then(|o| o.peel_to_tree())
+        .map_err(|e| e.message().to_string())?;
+    let entry = tree
+        .get_path(std::path::Path::new(&file_path))
+        .map_err(|e| e.message().to_string())?;
+    let blob = repo
+        .find_blob(entry.id())
+        .map_err(|e| e.message().to_string())?;
+    String::from_utf8(blob.content().to_vec()).map_err(|_| "File is not valid UTF-8".to_string())
+}
+
+#[tauri::command]
 pub async fn get_file_content(repo_path: String, file_path: String) -> Result<String, String> {
     let full = std::path::Path::new(&repo_path).join(&file_path);
     std::fs::read_to_string(&full).map_err(|e| e.to_string())

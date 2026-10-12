@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { EditorView, lineNumbers } from "@codemirror/view";
 import { EditorState, StateField, StateEffect, RangeSetBuilder } from "@codemirror/state";
 import { Decoration, DecorationSet } from "@codemirror/view";
@@ -86,7 +86,8 @@ const diffTheme = EditorView.theme({
   ".cm-scroller": { overflow: "visible !important" },
   ".cm-content": { lineHeight: "20px" },
   ".cm-line":    { padding: "0 6px", lineHeight: "20px" },
-  ".cm-gutters": { borderRight: "none" },
+  // appTheme hides gutters (merge editor draws its own); the diff needs them
+  ".cm-gutters": { borderRight: "none", display: "flex !important" },
 });
 
 // ── Build side doc + decorations ──────────────────────────────────────────────
@@ -140,15 +141,17 @@ function buildHunkPatch(filePath: string, header: string, lines: DiffLine[]): st
 // ── HunkView ──────────────────────────────────────────────────────────────────
 
 interface HunkViewProps {
-  rows: Row[];
   filePath: string;
   header: string;
-  lines?: DiffLine[];
+  showHeader: boolean;
+  lines: DiffLine[];
   onStageHunk?: (patch: string) => Promise<void>;
   onUnstageHunk?: (patch: string) => Promise<void>;
 }
 
-function HunkView({ rows, filePath, header, lines, onStageHunk, onUnstageHunk }: HunkViewProps) {
+function HunkView({ filePath, header, showHeader, lines, onStageHunk, onUnstageHunk }: HunkViewProps) {
+  // Memoized so parent re-renders don't tear down and rebuild both editors
+  const rows = useMemo(() => buildRows(lines), [lines]);
   const [staging, setStaging] = useState(false);
   const leftRef  = useRef<HTMLDivElement>(null);
   const rightRef = useRef<HTMLDivElement>(null);
@@ -230,8 +233,9 @@ function HunkView({ rows, filePath, header, lines, onStageHunk, onUnstageHunk }:
 
   return (
     <div>
+      {(showHeader || onStageHunk || onUnstageHunk) && (
       <div className="flex items-center gap-2 px-3 py-0.5 bg-blue-950/30 border-y border-blue-900/30">
-        <span className="flex-1 text-blue-400/70 text-[10px] font-mono">{header}</span>
+        <span className="flex-1 text-blue-400/70 text-[10px] font-mono">{showHeader ? header : ""}</span>
         {onStageHunk && lines && (
           <button
             onClick={handleStage}
@@ -251,6 +255,7 @@ function HunkView({ rows, filePath, header, lines, onStageHunk, onUnstageHunk }:
           </button>
         )}
       </div>
+      )}
       <div className="flex overflow-hidden">
         <div ref={leftRef}  className="flex-1 min-w-0 overflow-hidden border-r border-border/30" />
         <div ref={rightRef} className="flex-1 min-w-0 overflow-hidden" />
@@ -295,9 +300,9 @@ export function DiffViewer({ diff, loading, onStageHunk, onUnstageHunk }: DiffVi
           {file.hunks.map((hunk, hi) => (
             <HunkView
               key={hi}
-              rows={buildRows(hunk.lines)}
               filePath={file.path}
               header={hunk.header}
+              showHeader={file.hunks.length > 1}
               lines={hunk.lines}
               onStageHunk={onStageHunk ? (patch) => onStageHunk(file.path, patch) : undefined}
               onUnstageHunk={onUnstageHunk ? (patch) => onUnstageHunk(file.path, patch) : undefined}

@@ -7,18 +7,28 @@ import { useAppStore } from "@/store/appStore";
 export function useRepo() {
   const { addRepo, setOperationInProgress } = useAppStore();
 
-  const openRepo = useCallback(async () => {
-    const selected = await open({ directory: true, multiple: false });
-    if (!selected || typeof selected !== "string") return;
+  // Opens each path as its own tab; failures are reported per path so one bad
+  // folder doesn't block the rest.
+  const openRepoPaths = useCallback(
+    async (paths: string[]) => {
+      for (const path of paths) {
+        try {
+          const repo = await git.openRepo(path);
+          await git.addRecentRepo(path);
+          addRepo(repo);
+        } catch (e) {
+          toast.error(`Failed to open repo ${path}: ${e}`);
+        }
+      }
+    },
+    [addRepo]
+  );
 
-    try {
-      const repo = await git.openRepo(selected);
-      await git.addRecentRepo(selected);
-      addRepo(repo);
-    } catch (e) {
-      toast.error(`Failed to open repo: ${e}`);
-    }
-  }, [addRepo]);
+  const openRepo = useCallback(async () => {
+    const selected = await open({ directory: true, multiple: true });
+    if (!selected) return;
+    await openRepoPaths(Array.isArray(selected) ? selected : [selected]);
+  }, [openRepoPaths]);
 
   const openRepoFromPath = useCallback(
     async (path: string) => {
@@ -47,5 +57,5 @@ export function useRepo() {
     [setOperationInProgress]
   );
 
-  return { openRepo, openRepoFromPath, withOp };
+  return { openRepo, openRepoFromPath, openRepoPaths, withOp };
 }

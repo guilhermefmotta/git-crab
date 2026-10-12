@@ -8,7 +8,9 @@ import FileHistoryWindow from "./FileHistoryWindow";
 import BlameWindow from "./BlameWindow";
 import MergeWindow from "./MergeWindow";
 import ForgeWindow from "./ForgeWindow";
+import EditorWindow from "./EditorWindow";
 import { useApplySettings } from "./hooks/useApplySettings";
+import { useEscapeToClose } from "./hooks/useEscapeToClose";
 import "./index.css";
 
 attachConsole();
@@ -21,10 +23,15 @@ const repoPath = params.get("repoPath");
 
 function Root() {
   useApplySettings(); // reads localStorage and applies theme + zoom on every view
+  // Read-only secondary windows close on Esc. The main window, the merge
+  // resolver (in-progress resolutions) and the editor (handles its own unsaved
+  // check) are excluded.
+  useEscapeToClose(view !== null && view !== "merge" && view !== "editor");
   if (view === "commit" && hash) return <CommitDiffWindow hash={hash} />;
   if (view === "filediff" && key) return <FileDiffWindow storageKey={key} />;
   if (view === "filehistory" && key) return <FileHistoryWindow storageKey={key} />;
   if (view === "blame" && key) return <BlameWindow storageKey={key} />;
+  if (view === "editor" && key) return <EditorWindow storageKey={key} />;
   if (view === "merge" && repoPath) return <MergeWindow repoPath={decodeURIComponent(repoPath)} />;
   if (view === "forge" && repoPath) return <ForgeWindow repoPath={decodeURIComponent(repoPath)} />;
   return <App />;
