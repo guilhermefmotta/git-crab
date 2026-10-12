@@ -363,6 +363,67 @@ pub async fn list_repo_files(repo_path: String) -> Result<Vec<String>, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[derive(Serialize)]
+pub struct TreeFile {
+    pub path: String,
+    /// "modified" | "added" | "untracked" | "deleted" | "renamed" | "conflicted";
+    /// None when the file is unchanged
+    pub status: Option<&'static str>,
+}
+
+fn change_kind(s: git2::Status) -> Option<&'static str> {
+    use git2::Status as S;
+    if s.is_conflicted() {
+        Some("conflicted")
+    } else if s.intersects(S::INDEX_DELETED | S::WT_DELETED) {
+        Some("deleted")
+    } else if s.contains(S::INDEX_NEW) {
+        Some("added")
+    } else if s.contains(S::WT_NEW) {
+        Some("untracked")
+    } else if s.intersects(S::INDEX_RENAMED | S::WT_RENAMED) {
+        Some("renamed")
+    } else if s.intersects(S::INDEX_MODIFIED | S::WT_MODIFIED | S::INDEX_TYPECHANGE | S::WT_TYPECHANGE) {
+        Some("modified")
+    } else {
+        None
+    }
+}
+
+/// Explorer tree data: every file from `workdir_files` plus deleted ones, each
+/// tagged with its working-tree/index change.
+#[tauri::command]
+pub async fn list_repo_tree(repo_path: String) -> Result<Vec<TreeFile>, String> {
+    tokio::task::spawn_blocking(move || {
+        let repo = Repository::open(&repo_path).map_err(|e| e.message().to_string())?;
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(false)
+            .renames_head_to_index(true);
+        let statuses = repo
+            .statuses(Some(&mut opts))
+            .map_err(|e| e.message().to_string())?;
+
+        let mut changes = std::collections::HashMap::new();
+        for entry in statuses.iter() {
+            if let (Some(path), Some(kind)) = (entry.path(), change_kind(entry.status())) {
+                changes.insert(path.to_string(), kind);
+            }
+        }
+
+        let mut files: std::collections::BTreeSet<String> = workdir_files(&repo)?.into_iter().collect();
+        files.extend(changes.iter().filter(|(_, k)| **k == "deleted").map(|(p, _)| p.clone()));
+
+        Ok(files
+            .into_iter()
+            .map(|path| TreeFile { status: changes.get(&path).copied(), path })
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// File content as of a branch/ref, read from the object database (no checkout).
 #[tauri::command]
 pub async fn get_file_at_ref(

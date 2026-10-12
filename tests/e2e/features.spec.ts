@@ -415,7 +415,7 @@ describe("Features 07 — CommitDetail double-click opens CodeMirror", () => {
 
     await browser.execute(() => {
       const fileRow = document.querySelector("[data-testid^='commit-file-']") as HTMLElement | null;
-      fileRow?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      fileRow?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     await browser.pause(1000);
     await ss("21-after-commitdetail-dblclick");

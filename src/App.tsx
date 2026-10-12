@@ -4,6 +4,7 @@ import { Toaster } from "sonner";
 import { useAppStore } from "@/store/appStore";
 import { TopToolbar } from "@/components/layout/TopToolbar";
 import { Sidebar } from "@/components/layout/Sidebar";
+import { FileExplorer } from "@/components/layout/FileExplorer";
 import { CommitGraph } from "@/components/graph/CommitGraph";
 import { DetailPanel } from "@/components/layout/DetailPanel";
 import { WelcomeScreen } from "@/components/dialogs/WelcomeScreen";
@@ -85,6 +86,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen]   = useState(false);
   const [quickOpen, setQuickOpen]         = useState(false);
   const [searchOpen, setSearchOpen]       = useState(false);
+  const [explorerOpen, setExplorerOpen]   = useState(false);
   const [mergeStatus, setMergeStatus]     = useState<RepoStatus | null>(null);
   const [showResolver, setShowResolver]   = useState(false);
   const [sidebarWidth, setSidebarWidth]   = useState(240);
@@ -125,6 +127,7 @@ export default function App() {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key === ",") { e.preventDefault(); setSettingsOpen(true); return; }
+      if (mod && e.shiftKey && e.key.toLowerCase() === "e") { e.preventDefault(); setExplorerOpen((v) => !v); return; }
       if (mod && e.shiftKey && e.key.toLowerCase() === "f") { e.preventDefault(); setSearchOpen(true); return; }
       if (mod && e.key.toLowerCase() === "p") { e.preventDefault(); setQuickOpen(true); return; }
       if (mod && e.key === "f") {
@@ -175,7 +178,10 @@ export default function App() {
         ) : (
           <>
             <div data-testid="sidebar-wrapper" style={{ width: sidebarWidth, flexShrink: 0 }} className="min-w-0 overflow-hidden">
-              <Sidebar onOperationComplete={refreshMergeStatus} />
+              {/* Ctrl/Cmd+Shift+E swaps the branch sidebar for the file tree, like VS Code */}
+              {explorerOpen
+                ? <FileExplorer onClose={() => setExplorerOpen(false)} />
+                : <Sidebar onOperationComplete={refreshMergeStatus} />}
             </div>
             <ResizeDivider testId="resize-divider-sidebar" onDelta={(dx) => setSidebarWidth(w => Math.max(160, Math.min(520, w + dx)))} />
             <CommitGraph />

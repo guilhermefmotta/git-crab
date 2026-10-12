@@ -3,7 +3,6 @@ import { formatDistanceToNow, format } from "date-fns";
 import { GitCommit, User, Clock } from "lucide-react";
 import { git } from "@/lib/tauri";
 import { useAppStore } from "@/store/appStore";
-import { DiffViewer } from "./DiffViewer";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -35,9 +34,6 @@ export function CommitDetail({ commit }: { commit: CommitInfo }) {
           commitHash: commit.hash,
         });
         setDiff(result);
-        // Rendering every file of a large commit at once freezes the webview,
-        // so show one file at a time, starting with the first
-        setSelectedFilePath(result[0]?.path ?? null);
       } catch {
         setDiff([]);
       } finally {
@@ -87,20 +83,24 @@ export function CommitDetail({ commit }: { commit: CommitInfo }) {
       </div>
 
       {/* Changed files */}
-      {diff.length > 0 && (
-        <div className="border-b border-border shrink-0">
+      {loadingDiff && (
+        <p className="px-3 py-2 text-xs text-muted-foreground">Loading files…</p>
+      )}
+      {!loadingDiff && diff.length > 0 && (
+        <div className="flex flex-col flex-1 min-h-0">
           <p className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             Changed files ({diff.length})
           </p>
-          <div className="max-h-28 overflow-y-auto">
+          <div className="flex-1 overflow-y-auto">
             {diff.map((f) => (
               <ContextMenu key={f.path}>
                 <ContextMenuTrigger asChild>
                   <div
                     data-testid={`commit-file-${f.path.replace(/\//g, "-")}`}
-                    onClick={() => setSelectedFilePath(f.path)}
-                    onDoubleClick={() => {
+                    title="Open diff"
+                    onClick={() => {
                       if (!activeRepo) return;
+                      setSelectedFilePath(f.path);
                       const key = `commit_${commit.hash}_${f.path.replace(/[^a-zA-Z0-9_\-]/g, "_")}`;
                       localStorage.setItem(`git_rust_filediff_${key}`, JSON.stringify({
                         repoPath: activeRepo.path,
@@ -162,14 +162,6 @@ export function CommitDetail({ commit }: { commit: CommitInfo }) {
           </div>
         </div>
       )}
-
-      {/* Diff view */}
-      <div className="flex-1 overflow-hidden">
-        <DiffViewer
-          diff={diff.filter((f) => f.path === selectedFilePath)}
-          loading={loadingDiff}
-        />
-      </div>
     </div>
   );
 }

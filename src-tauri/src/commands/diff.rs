@@ -117,3 +117,79 @@ pub async fn get_diff(
 
     parse_diff(diff)
 }
+
+#[derive(serde::Serialize)]
+pub struct LineChange {
+    /// "added" | "modified" | "deleted"
+    pub kind: &'static str,
+    /// 1-based, inclusive line range in the current buffer. For "deleted" both
+    /// are the line after which lines were removed (0 = top of file).
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Changed line ranges of `content` (the editor buffer, possibly unsaved)
+/// against the file as committed at HEAD — drives the editor's gutter markers.
+#[tauri::command]
+pub async fn get_line_changes(
+    repo_path: String,
+    file_path: String,
+    content: String,
+) -> Result<Vec<LineChange>, String> {
+    tokio::task::spawn_blocking(move || {
+        let repo = Repository::open(&repo_path).map_err(|e| e.message().to_string())?;
+        let head_blob = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_tree().ok())
+            .and_then(|t| t.get_path(std::path::Path::new(&file_path)).ok())
+            .and_then(|e| repo.find_blob(e.id()).ok());
+
+        // Not in HEAD (new/untracked): every line is an addition
+        let Some(blob) = head_blob else {
+            let lines = content.lines().count().max(1) as u32;
+            return Ok(vec![LineChange { kind: "added", start: 1, end: lines }]);
+        };
+
+        let mut opts = git2::DiffOptions::new();
+        opts.context_lines(0);
+        let patch = git2::Patch::from_blob_and_buffer(
+            &blob, None, content.as_bytes(), None, Some(&mut opts),
+        )
+        .map_err(|e| e.message().to_string())?;
+
+        let mut out = Vec::new();
+        for i in 0..patch.num_hunks() {
+            let (hunk, _) = patch.hunk(i).map_err(|e| e.message().to_string())?;
+            let (start, count) = (hunk.new_start(), hunk.new_lines());
+            let change = if hunk.old_lines() == 0 {
+                LineChange { kind: "added", start, end: start + count - 1 }
+            } else if count == 0 {
+                LineChange { kind: "deleted", start, end: start }
+            } else {
+                LineChange { kind: "modified", start, end: start + count - 1 }
+            };
+            out.push(change);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Classifies hunks against a real repo: LINE_CHANGES_REPO=... LINE_CHANGES_FILE=...
+    #[tokio::test]
+    #[ignore]
+    async fn line_changes_against_repo() {
+        let repo = std::env::var("LINE_CHANGES_REPO").unwrap();
+        let file = std::env::var("LINE_CHANGES_FILE").unwrap();
+        let content = std::fs::read_to_string(std::path::Path::new(&repo).join(&file)).unwrap();
+        for c in get_line_changes(repo, file, content).await.unwrap() {
+            println!("{} {}-{}", c.kind, c.start, c.end);
+        }
+    }
+}

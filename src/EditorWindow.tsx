@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, Save } from "lucide-react";
+import { Loader2, Save, Users } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from "@codemirror/view";
-import { EditorState, EditorSelection } from "@codemirror/state";
+import { EditorState, EditorSelection, Compartment } from "@codemirror/state";
 import { defaultKeymap, historyKeymap, history, indentWithTab } from "@codemirror/commands";
 import {
   search, searchKeymap, highlightSelectionMatches, SearchQuery, setSearchQuery, openSearchPanel,
 } from "@codemirror/search";
 import { appTheme, appHighlight } from "@/components/merge/cm/theme";
 import { getLanguage } from "@/components/merge/cm/lang";
+import { lineChanges, setLineChanges } from "@/components/merge/cm/lineChanges";
+import { blameGutter, setLineAuthors } from "@/components/merge/cm/blameGutter";
 import { git } from "@/lib/tauri";
 import { useEscapeToClose } from "@/hooks/useEscapeToClose";
 
@@ -114,6 +116,11 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
   const viewRef = useRef<EditorView | null>(null);
   const savedRef = useRef("");
   const [viewReady, setViewReady] = useState(0);
+  const [showBlame, setShowBlame] = useState(false);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const blameOnRef = useRef(false);
+  const blameCompartment = useRef(new Compartment()).current;
+  const refreshBlameRef = useRef<(delay: number) => void>(() => {});
 
   useEffect(() => {
     const load = () => {
@@ -175,6 +182,43 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
     let view: EditorView | null = null;
     let cancelled = false;
 
+    // Gutter markers vs HEAD, recomputed (debounced) as the buffer changes.
+    // Skipped for read-only branch views, where "changed vs HEAD" is meaningless.
+    let diffTimer: ReturnType<typeof setTimeout> | undefined;
+    let diffRequest = 0;
+    const refreshChanges = (v: EditorView, delay: number) => {
+      if (meta.rev) return;
+      clearTimeout(diffTimer);
+      clearTimeout(blameTimer);
+      diffTimer = setTimeout(() => {
+        const id = ++diffRequest;
+        git.getLineChanges(meta.repoPath, meta.filePath, v.state.doc.toString())
+          .then((changes) => {
+            if (cancelled || id !== diffRequest) return;
+            v.dispatch({ effects: setLineChanges.of(changes) });
+          })
+          .catch(() => {});
+      }, delay);
+    };
+
+    // Line authors (blame), only fetched while the gutter is shown
+    let blameTimer: ReturnType<typeof setTimeout> | undefined;
+    let blameRequest = 0;
+    refreshBlameRef.current = (delay: number) => {
+      const v = viewRef.current;
+      if (!v || !blameOnRef.current) return;
+      clearTimeout(blameTimer);
+      blameTimer = setTimeout(() => {
+        const id = ++blameRequest;
+        git.getLineAuthors(meta.repoPath, meta.filePath, v.state.doc.toString(), meta.rev)
+          .then((authors) => {
+            if (cancelled || id !== blameRequest) return;
+            v.dispatch({ effects: setLineAuthors.of(authors) });
+          })
+          .catch((e) => toast.error(`Blame failed: ${e}`));
+      }, delay);
+    };
+
     const load = meta.rev
       ? git.getFileAtRef(meta.repoPath, meta.rev, meta.filePath)
       : git.getFileContent(meta.repoPath, meta.filePath);
@@ -191,7 +235,9 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
               editorTheme,
               appHighlight,
               EditorState.readOnly.of(!!meta.rev),
+              blameCompartment.of(blameOnRef.current ? blameGutter() : []),
               lineNumbers(),
+              ...(meta.rev ? [] : [lineChanges()]),
               highlightActiveLine(),
               highlightActiveLineGutter(),
               history(),
@@ -205,7 +251,11 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
                 ...historyKeymap,
               ]),
               EditorView.updateListener.of((u) => {
-                if (u.docChanged) setDirty(u.state.doc.toString() !== savedRef.current);
+                if (u.docChanged) {
+                  setDirty(u.state.doc.toString() !== savedRef.current);
+                  refreshChanges(u.view, 300);
+                  refreshBlameRef.current(500);
+                }
               }),
               ...(lang ? [lang] : []),
             ],
@@ -213,6 +263,8 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
           parent: containerRef.current,
         });
         viewRef.current = view;
+        refreshChanges(view, 0);
+        refreshBlameRef.current(0);
         view.focus();
         setViewReady((n) => n + 1);
       })
@@ -221,6 +273,7 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
 
     return () => {
       cancelled = true;
+      clearTimeout(diffTimer);
       view?.destroy();
       viewRef.current = null;
     };
@@ -252,6 +305,30 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
     });
     view.focus();
   }, [viewReady, meta?.line, meta?.query, meta?.caseSensitive, meta?.nonce]);
+
+  const toggleBlame = () => {
+    setMenu(null);
+    const next = !blameOnRef.current;
+    blameOnRef.current = next;
+    setShowBlame(next);
+    viewRef.current?.dispatch({ effects: blameCompartment.reconfigure(next ? blameGutter() : []) });
+    if (next) refreshBlameRef.current(0);
+  };
+
+  // Close the context menu on any outside click or Esc
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("blur", close);
+    };
+  }, [menu]);
 
   useEffect(() => {
     if (meta) document.title = `${dirty ? "● " : ""}${meta.filePath}${meta.rev ? ` @ ${meta.rev}` : ""}`;
@@ -290,7 +367,29 @@ export default function EditorWindow({ storageKey }: { storageKey: string }) {
               <Loader2 size={16} className="animate-spin text-muted-foreground" />
             </div>
           )}
-          <div ref={containerRef} className="h-full" />
+          <div
+            ref={containerRef}
+            className="h-full"
+            onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY }); }}
+          />
+          {menu && (
+            <div
+              role="menu"
+              style={{ left: menu.x, top: menu.y }}
+              onMouseDown={(e) => e.stopPropagation()}
+              className="fixed z-50 min-w-48 rounded-md border border-border bg-popover py-1 text-xs shadow-xl"
+            >
+              <button
+                role="menuitem"
+                data-testid="editor-toggle-blame"
+                onClick={toggleBlame}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-accent"
+              >
+                <Users size={12} className="text-muted-foreground" />
+                {showBlame ? "Hide line authors" : "Show line authors (blame)"}
+              </button>
+            </div>
+          )}
         </div>
       )}
       <Toaster position="bottom-right" theme="dark" />

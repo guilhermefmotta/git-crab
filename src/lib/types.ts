@@ -129,3 +129,26 @@ export interface SearchResult {
   files_searched: number;
   truncated: boolean;
 }
+
+export type FileChange = "modified" | "added" | "untracked" | "deleted" | "renamed" | "conflicted";
+
+export interface TreeFile {
+  path: string;
+  /** null when unchanged */
+  status: FileChange | null;
+}
+
+export interface LineChange {
+  kind: "added" | "modified" | "deleted";
+  /** 1-based inclusive range in the editor buffer; for "deleted", the line after which lines were removed (0 = top) */
+  start: number;
+  end: number;
+}
+
+export interface LineAuthor {
+  hash: string;
+  short_hash: string;
+  author: string;
+  timestamp: number;
+  summary: string;
+}

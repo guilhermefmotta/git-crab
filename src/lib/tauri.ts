@@ -9,6 +9,9 @@ import type {
   StashInfo,
   TagInfo,
   SearchResult,
+  TreeFile,
+  LineChange,
+  LineAuthor,
 } from "./types";
 import type { RepoStatus, ConflictContent, MergeOutcome, CheckoutOutcome } from "./mergeTypes";
 
@@ -162,6 +165,12 @@ export const git = {
     invoke<void>("ignore_file", { repoPath, filePath }),
   listRepoFiles: (repoPath: string) =>
     invoke<string[]>("list_repo_files", { repoPath }),
+  listRepoTree: (repoPath: string) =>
+    invoke<TreeFile[]>("list_repo_tree", { repoPath }),
+  getLineChanges: (repoPath: string, filePath: string, content: string) =>
+    invoke<LineChange[]>("get_line_changes", { repoPath, filePath, content }),
+  getLineAuthors: (repoPath: string, filePath: string, content: string, rev?: string) =>
+    invoke<(LineAuthor | null)[]>("get_line_authors", { repoPath, filePath, content, rev }),
   getFileAtRef: (repoPath: string, rev: string, filePath: string) =>
     invoke<string>("get_file_at_ref", { repoPath, rev, filePath }),
   searchText: (repoPath: string, query: string, rev?: string, caseSensitive?: boolean) =>

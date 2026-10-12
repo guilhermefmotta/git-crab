@@ -1,4 +1,5 @@
-import type { LanguageSupport } from "@codemirror/language";
+import { LanguageSupport, StreamLanguage } from "@codemirror/language";
+import { dart } from "@codemirror/legacy-modes/mode/clike";
 import { rust } from "@codemirror/lang-rust";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
@@ -34,6 +35,8 @@ export function getLanguage(filePath: string): LanguageSupport | null {
     case "yaml": case "yml":            return yaml();
     case "xml": case "svg":             return xml();
     case "sql":                         return sql();
+    // No official @codemirror/lang-dart; the legacy (CodeMirror 5) mode is the standard route
+    case "dart":                        return new LanguageSupport(StreamLanguage.define(dart));
     default:                            return null;
   }
 }
@@ -48,7 +51,7 @@ export function hlLang(filePath: string): string {
     java: "java", go: "go", css: "css", scss: "css", html: "html", htm: "html",
     json: "json", jsonc: "json", md: "markdown", mdx: "markdown", yaml: "yaml", yml: "yaml",
     xml: "xml", svg: "xml", sql: "sql", sh: "bash", bash: "bash", zsh: "bash",
-    toml: "ini", dockerfile: "dockerfile",
+    toml: "ini", dockerfile: "dockerfile", dart: "dart",
   };
   return map[ext] ?? "plaintext";
 }
