@@ -14,6 +14,9 @@ import { SearchDialog } from "@/components/dialogs/SearchDialog";
 import { MergeWorkspace } from "@/components/merge/MergeWorkspace";
 import { useStatus } from "@/hooks/useStatus";
 import { useRepo } from "@/hooks/useRepo";
+import { useCommits } from "@/hooks/useCommits";
+import { useBranches } from "@/hooks/useBranches";
+import { onRepoChanged } from "@/lib/repoEvents";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { git } from "@/lib/tauri";
 import type { RepoStatus } from "@/lib/mergeTypes";
@@ -83,6 +86,8 @@ export default function App() {
   const { activeRepo, settings, setSelectedCommitHash, status: fileStatus } = useAppStore();
   const { refresh: refreshFileStatus } = useStatus();
   const { openRepoPaths } = useRepo();
+  const { loadCommits } = useCommits();
+  const { refresh: refreshBranches, refreshHead } = useBranches();
   const [settingsOpen, setSettingsOpen]   = useState(false);
   const [quickOpen, setQuickOpen]         = useState(false);
   const [searchOpen, setSearchOpen]       = useState(false);
@@ -157,10 +162,34 @@ export default function App() {
   // Derive conflict state from fileStatus (same source as WorkingTree) — always accurate
   const hasConflicts = fileStatus.some(f => f.status === "conflicted");
 
+  // Reload everything the main window shows about the repo
+  const refreshAll = useCallback(async () => {
+    if (!activeRepo) return;
+    await Promise.all([
+      refreshMergeStatus(), refreshFileStatus(), loadCommits(0), refreshBranches(), refreshHead(),
+    ]);
+  }, [activeRepo, refreshMergeStatus, refreshFileStatus, loadCommits, refreshBranches, refreshHead]);
+
+  // Other windows (merge resolver, editor) change the repo behind our back:
+  // reload when they say so, and whenever this window regains focus (also
+  // catches changes made from a terminal)
+  const refreshAllRef = useRef(refreshAll);
+  refreshAllRef.current = refreshAll;
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    onRepoChanged((path) => {
+      if (path === useAppStore.getState().activeRepo?.path) refreshAllRef.current();
+    }).then((fn) => { if (cancelled) fn(); else unlisten = fn; });
+    const onFocus = () => refreshAllRef.current();
+    window.addEventListener("focus", onFocus);
+    return () => { cancelled = true; unlisten?.(); window.removeEventListener("focus", onFocus); };
+  }, []);
+
   const handleResolverDone = async () => {
     setShowResolver(false);
     setMergeStatus(null); // clear immediately to avoid stale banner flash
-    await Promise.all([refreshMergeStatus(), refreshFileStatus()]);
+    await refreshAll();
   };
 
   return (

@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { git } from "@/lib/tauri";
 import type { ConflictContent, RepoStatus } from "@/lib/mergeTypes";
 import { ThreePaneEditor } from "./ThreePaneEditor";
+import { emitRepoChanged } from "@/lib/repoEvents";
 
 // ── File editor: loads content and delegates to ThreePaneEditor ───────────────
 
@@ -186,19 +187,23 @@ export function MergeWorkspace({ repoPath, status, onDone }: Props) {
     setCurrent(status.conflictedFiles[0] ?? null);
   }, [status.conflictedFiles.join(",")]);
 
+  // "Done" on a file: mark it resolved and jump to the next unresolved one
+  // (null once every file is done, which shows the commit prompt)
   const handleStaged = useCallback(() => {
-    setResolved(prev => {
-      const next = new Set(prev).add(current!);
-      const remaining = status.conflictedFiles.filter(f => !next.has(f));
-      setCurrent(remaining[0] ?? current);
-      return next;
-    });
-  }, [current, status.conflictedFiles]);
+    if (!current) return;
+    const next = new Set(resolved).add(current);
+    setResolved(next);
+    emitRepoChanged(repoPath);
+    const after = status.conflictedFiles.slice(status.conflictedFiles.indexOf(current) + 1);
+    const before = status.conflictedFiles.slice(0, status.conflictedFiles.indexOf(current));
+    setCurrent([...after, ...before].find(f => !next.has(f)) ?? null);
+  }, [current, resolved, status.conflictedFiles, repoPath]);
 
   const handleAbort = async () => {
     try {
       await git.abortOperation(repoPath);
       toast.success("Operation aborted — files restored");
+      emitRepoChanged(repoPath);
       onDone();
     } catch (e) {
       toast.error(String(e));
@@ -223,6 +228,7 @@ export function MergeWorkspace({ repoPath, status, onDone }: Props) {
       } else {
         toast.success("Conflicts resolved");
       }
+      emitRepoChanged(repoPath);
       onDone();
     } catch (e) {
       toast.error(String(e));
@@ -259,6 +265,19 @@ export function MergeWorkspace({ repoPath, status, onDone }: Props) {
                 setCurrent(remaining[0] ?? null);
               }}
             />
+          ) : status.conflictedFiles.length > 0 && resolved.size >= status.conflictedFiles.length ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3" data-testid="all-files-resolved">
+              <CheckCircle size={28} className="text-green-400" />
+              <p className="text-sm text-foreground">All {status.conflictedFiles.length} files resolved</p>
+              <button
+                onClick={handleComplete}
+                disabled={completing}
+                className="flex items-center gap-1.5 px-4 py-2 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors disabled:opacity-40"
+              >
+                {completing && <Loader2 size={12} className="animate-spin" />}
+                {status.operation === "Rebasing" ? "Continue rebase" : status.operation === "Merging" ? "Commit merge" : "Finish"}
+              </button>
+            </div>
           ) : (
             <div className="flex items-center justify-center h-full">
               <p className="text-xs text-muted-foreground">Select a file to view conflicts</p>

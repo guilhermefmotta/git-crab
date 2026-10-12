@@ -68,6 +68,32 @@ export function parseConflictRanges(doc: string): Omit<ConflictRange, "idx" | "s
   return ranges;
 }
 
+// ── Conflict blocks tracked through edits ────────────────────────────────────
+
+/**
+ * Where each original conflict lives in the center document, kept in place by
+ * mapping through every change (accepting a side, typing, undo). Index i is
+ * always original conflict i, unlike re-parsing markers, which renumbers the
+ * remaining conflicts once one is resolved.
+ */
+export interface ConflictBlock { from: number; to: number }
+
+export const setConflictBlocks = StateEffect.define<ConflictBlock[]>();
+
+export const conflictBlocksField = StateField.define<ConflictBlock[]>({
+  create: () => [],
+  update(blocks, tr) {
+    for (const e of tr.effects) if (e.is(setConflictBlocks)) return e.value;
+    if (!tr.docChanged) return blocks;
+    // Start sticks left and end sticks right, so text replacing the whole
+    // block (or appended at its end) stays inside it
+    return blocks.map(b => {
+      const from = tr.changes.mapPos(b.from, -1);
+      return { from, to: Math.max(from, tr.changes.mapPos(b.to, 1)) };
+    });
+  },
+});
+
 // ── StateEffect to update conflict info ──────────────────────────────────────
 
 export const setConflictRanges = StateEffect.define<ConflictRange[]>();
@@ -159,6 +185,7 @@ export const centerConflictPlugin = ViewPlugin.fromClass(class {
         const eLine = doc.lineAt(Math.min(r.markerTo - 1, doc.length - 1));
         decos.push(Decoration.line({ class: "cm-conflict-marker" }).range(eLine.from));
       } else {
+        if (r.markerTo <= r.markerFrom) continue; // resolved to nothing
         const cls =
           r.status === "ours"    ? "cm-resolved-ours"
           : r.status === "theirs"  ? "cm-resolved-theirs"

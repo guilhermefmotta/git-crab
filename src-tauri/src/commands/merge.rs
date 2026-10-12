@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
+// Variant names go over the wire as-is: the frontend's GitOperation union is
+// PascalCase ("Merging", "Clean"…)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub enum GitOperation {
     Clean,
     Merging,
@@ -434,4 +435,116 @@ pub async fn do_merge(repo_path: String, branch_name: String) -> Result<MergeOut
 
     let conflicts = conflicted_paths(&repo)?;
     Ok(MergeOutcome { fast_forward: false, conflicted_files: conflicts })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frontend's GitOperation union is PascalCase ("Merging", "Clean"…)
+    #[test]
+    fn git_operation_serializes_like_the_frontend_type() {
+        assert_eq!(serde_json::to_string(&GitOperation::Merging).unwrap(), "\"Merging\"");
+        assert_eq!(serde_json::to_string(&GitOperation::Clean).unwrap(), "\"Clean\"");
+        assert_eq!(serde_json::to_string(&GitOperation::CherryPicking).unwrap(), "\"CherryPicking\"");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        run_git(dir, args).unwrap_or_else(|e| panic!("git {:?}: {}", args, e));
+    }
+
+    fn write(dir: &std::path::Path, file: &str, content: &str) {
+        let p = dir.join(file);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    /// Same shape as the manual demo repo: two branches editing the same lines
+    /// of three files, plus non-conflicting changes on both sides.
+    fn conflict_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gitcrab-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "Tester"]);
+        write(&dir, "config.go", "package config\n\nfunc Load() Config {\n\treturn Config{\n\t\tURL: \"local\",\n\t\tTimeout: 30,\n\t}\n}\n");
+        write(&dir, "web/app.ts", "export function greet(name: string) {\n  return `Hello ${name}`;\n}\n\nexport const MAX = 3;\n");
+        write(&dir, "README.md", "# Demo\n\nRun `make dev`.\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "base"]);
+
+        git(&dir, &["checkout", "-qb", "feature"]);
+        write(&dir, "config.go", "package config\n\nfunc Load() Config {\n\treturn Config{\n\t\tURL: \"internal\",\n\t\tTimeout: 60,\n\t}\n}\n");
+        write(&dir, "web/app.ts", "export function greet(name: string) {\n  return `Welcome ${name}`;\n}\n\nexport const MAX = 5;\n");
+        write(&dir, "README.md", "# Demo\n\nRun `npm run dev`.\n");
+        write(&dir, "web/feature.ts", "feature only\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "feature"]);
+
+        git(&dir, &["checkout", "-q", "main"]);
+        write(&dir, "config.go", "package config\n\nfunc Load() Config {\n\treturn Config{\n\t\tURL: \"prod\",\n\t\tTimeout: 15,\n\t}\n}\n");
+        write(&dir, "web/app.ts", "export function greet(name: string) {\n  return `Hi ${name}`;\n}\n\nexport const MAX = 3;\n");
+        write(&dir, "README.md", "# Demo\n\nRun `docker compose up`.\n");
+        git(&dir, &["commit", "-qam", "main"]);
+        dir
+    }
+
+    /// The whole resolver flow the UI drives: merge → per-file Done
+    /// (resolve_conflict) → Commit merge, with an "Unstage all" in the middle,
+    /// ending in a clean repo with a two-parent merge commit.
+    #[tokio::test]
+    async fn merge_conflict_flow_end_to_end() {
+        let dir = conflict_repo("merge-flow");
+        let repo_path = dir.to_string_lossy().to_string();
+
+        let outcome = do_merge(repo_path.clone(), "feature".into()).await.unwrap();
+        let mut conflicted = outcome.conflicted_files.clone();
+        conflicted.sort();
+        assert_eq!(conflicted, vec!["README.md", "config.go", "web/app.ts"]);
+
+        let status = get_repo_status(repo_path.clone()).await.unwrap();
+        assert_eq!(status.operation, GitOperation::Merging);
+        assert_eq!(status.conflicted_files.len(), 3);
+
+        // Resolve each file the way the editor would: take "ours" for every
+        // conflict (the resolver writes the full merged text)
+        for (i, file) in conflicted.iter().enumerate() {
+            let content = get_conflict_content(repo_path.clone(), file.clone()).await.unwrap();
+            assert!(content.merged.contains("<<<<<<<"), "{file} should have markers");
+            resolve_conflict(repo_path.clone(), file.clone(), content.ours.clone()).await.unwrap();
+
+            // Unstaging mid-merge must not abort the merge
+            if i == 0 {
+                crate::commands::status::unstage_all(repo_path.clone()).await.unwrap();
+                assert!(dir.join(".git/MERGE_HEAD").exists(), "unstage_all aborted the merge");
+                // Unstaging also drops the cleanly merged files; "Stage all" brings them back
+                crate::commands::status::stage_all(repo_path.clone()).await.unwrap();
+            }
+
+            let s = get_repo_status(repo_path.clone()).await.unwrap();
+            assert_eq!(s.operation, GitOperation::Merging);
+            assert_eq!(s.conflicted_files.len(), conflicted.len() - i - 1);
+        }
+
+        complete_merge_commit(repo_path.clone(), None).await.unwrap();
+
+        // What the main window needs to stop showing the banner
+        let done = get_repo_status(repo_path.clone()).await.unwrap();
+        assert_eq!(done.operation, GitOperation::Clean);
+        assert!(done.conflicted_files.is_empty());
+        assert!(!dir.join(".git/MERGE_HEAD").exists());
+
+        let repo = Repository::open(&dir).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_count(), 2, "expected a merge commit");
+        let config = std::fs::read_to_string(dir.join("config.go")).unwrap();
+        assert!(config.contains("\"prod\"") && config.contains("Timeout: 15,\n\t}"), "{config}");
+        assert!(dir.join("web/feature.ts").exists(), "non-conflicting change from feature lost");
+        let dirty: Vec<String> = repo.statuses(None).unwrap().iter()
+            .map(|e| format!("{:?} {}", e.status(), e.path().unwrap_or(""))).collect();
+        assert!(dirty.is_empty(), "working tree not clean: {dirty:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -3,7 +3,11 @@
  *
  * Left  (read-only): full `ours` content, conflict lines highlighted green.
  * Center (editable): full merged document with CodeMirror. Conflict marker
- *                    blocks are highlighted; accepting replaces them in place.
+ *                    blocks are highlighted. Like IntelliJ, each side can be
+ *                    applied independently: the first replaces the markers,
+ *                    the second is appended below, and ✕ ignores a side
+ *                    without taking anything from it; the result stays editable
+ *                    and "Done" writes + stages the file.
  * Right (read-only): full `theirs` content, conflict lines highlighted blue.
  *
  * Phantom lines keep all three panes the same total height so a single outer
@@ -16,7 +20,7 @@ import {
 import { EditorView } from "@codemirror/view";
 import {
   ChevronsLeft, ChevronsRight, ChevronDown, ChevronUp,
-  CheckCircle, SkipForward, Loader2, Undo2, Redo2,
+  CheckCircle, SkipForward, Loader2, Undo2, Redo2, X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -26,6 +30,7 @@ import type { ConflictContent, ConflictStatus } from "@/lib/mergeTypes";
 import { getLanguage } from "./cm/lang";
 import {
   conflictRangesField, centerConflictPlugin, centerPhantomDecoField, setConflictRanges,
+  conflictBlocksField, setConflictBlocks, type ConflictBlock,
   phantomLinesField, setPhantomLines, parseConflictRanges,
   sidePaneConflictsField, sidePanePlugin, sidePanePhantomDecoField, setSidePaneConflicts,
   type ConflictRange, type SidePaneConflict,
@@ -36,6 +41,15 @@ import { undo, redo, undoDepth, redoDepth } from "@codemirror/commands";
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const LINE_H = 20;
+
+// Conflict marker lines. "=======" alone isn't checked: it's also a Markdown
+// heading underline.
+const MARKER_RE = /^(<<<<<<<|>>>>>>>)/m;
+
+/** What happened to one side of one conflict */
+type SideState = "pending" | "applied" | "ignored";
+type Applied = { ours: SideState; theirs: SideState };
+const PENDING: Applied = { ours: "pending", theirs: "pending" };
 
 // ── ThreePaneEditor ───────────────────────────────────────────────────────────
 
@@ -118,21 +132,44 @@ export function ThreePaneEditor({
     return { oursConflicts, theirsConflicts };
   }, [segs]);
 
-  // ── Status tracking: Map<conflictIdx → status> from center doc ───────────
-  const [conflictStateMap, setConflictStateMap] = useState<Map<number, ConflictStatus>>(new Map());
+  // ── Per-conflict state ─────────────────────────────────────────────────────
+  // Which sides were applied to each conflict, and where each conflict block
+  // currently sits in the center doc (mirrors conflictBlocksField).
+  const [applied, setApplied] = useState<Applied[]>(
+    () => initialConflicts.map(() => PENDING),
+  );
+  const [blocks, setBlocks] = useState<ConflictBlock[]>([]);
 
-  const updateConflictStates = useCallback((doc: string) => {
-    const m = new Map<number, ConflictStatus>();
-    for (const ic of initialConflicts) {
-      const hasMarker = doc.includes(`<<<<<<< ${ic.ourLabel}`) || doc.includes(`>>>>>>> ${ic.theirLabel}`);
-      m.set(ic.idx, hasMarker ? "unresolved" : "manual");
+  const blockInfo = useMemo(() => blocks.map((b, i) => {
+    const text = centerDoc.slice(b.from, b.to);
+    const a = applied[i] ?? PENDING;
+    const ours = a.ours === "applied", theirs = a.theirs === "applied";
+    const status: ConflictStatus =
+      MARKER_RE.test(text) ? "unresolved"
+      : ours && theirs ? "both"
+      : ours ? "ours"
+      : theirs ? "theirs"
+      : "manual";
+    const lines = text.length === 0 ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+    return { ...b, text, status, lines };
+  }), [blocks, centerDoc, applied]);
+
+  // Undo back to the marker block makes both sides available again
+  useEffect(() => {
+    const touched = (a?: Applied) => !!a && (a.ours !== "pending" || a.theirs !== "pending");
+    if (blockInfo.some((b, i) => b.status === "unresolved" && touched(applied[i]))) {
+      setApplied(prev => prev.map((a, i) => blockInfo[i]?.status === "unresolved" ? PENDING : a));
     }
-    setConflictStateMap(m);
-  }, [initialConflicts]);
+  }, [blockInfo]);
+
+  const conflictStateMap = useMemo(
+    () => new Map(blockInfo.map((b, i) => [i, b.status] as const)),
+    [blockInfo],
+  );
 
   const resolvedCount = useMemo(
-    () => [...conflictStateMap.values()].filter(v => v !== "unresolved").length,
-    [conflictStateMap],
+    () => blockInfo.filter(b => b.status !== "unresolved").length,
+    [blockInfo],
   );
   const allDone = resolvedCount === total; // total=0 means diffy resolved cleanly
 
@@ -147,7 +184,6 @@ export function ThreePaneEditor({
     // phantom_right_i = max_i - theirs_lines_i
     // phantom_center_i = max_i - center_lines_i (added after conflict region)
 
-    const centerRanges = parseConflictRanges(centerDoc);
     const oursPhantoms: Array<{ afterEndLine: number; height: number }>   = [];
     const theirsPhantoms: Array<{ afterEndLine: number; height: number }> = [];
     const centerPhantoms: Array<{ pos: number; height: number }>          = [];
@@ -156,18 +192,8 @@ export function ThreePaneEditor({
       const ic = initialConflicts[i];
       const oursLines   = ic.oursLines.length;
       const theirsLines = ic.theirsLines.length;
-
-      // Find corresponding center range by checking if marker is present
-      // Use remaining centerRanges in order (approximate)
-      let centerLines = 0;
-      if (i < centerRanges.length) {
-        const cr = centerRanges[i];
-        const sub = centerDoc.slice(cr.markerFrom, cr.markerTo);
-        centerLines = sub.split("\n").length;
-      } else {
-        // Resolved — content is oursLines or theirsLines (we can't know which exactly)
-        centerLines = Math.max(oursLines, theirsLines); // safe estimate
-      }
+      const block = blockInfo[i];
+      const centerLines = block ? block.lines : Math.max(oursLines, theirsLines);
 
       const maxLines = Math.max(oursLines, theirsLines, centerLines, 1);
 
@@ -183,15 +209,14 @@ export function ThreePaneEditor({
         theirsPhantoms.push({ afterEndLine: theirsConfl.endLine, height: (maxLines - theirsLines) * LINE_H });
       }
 
-      // Center phantom (add after center conflict region, if center is shorter)
-      if (i < centerRanges.length && maxLines > centerLines) {
-        const cr = centerRanges[i];
-        centerPhantoms.push({ pos: cr.markerTo, height: (maxLines - centerLines) * LINE_H });
+      // Center phantom (after the conflict block, when it is the shortest)
+      if (block && maxLines > centerLines) {
+        centerPhantoms.push({ pos: block.to, height: (maxLines - centerLines) * LINE_H });
       }
     }
 
     return { oursPhantoms, theirsPhantoms, centerPhantoms };
-  }, [centerDoc, initialConflicts, sideRanges]);
+  }, [blockInfo, initialConflicts, sideRanges]);
 
   // ── Initialize CM editors ─────────────────────────────────────────────────
   useEffect(() => {
@@ -212,13 +237,22 @@ export function ThreePaneEditor({
     centerView.current = makeEditableEditor(centerRef.current, content.merged, [
       ...sharedExtras,
       conflictRangesField,
+      conflictBlocksField,
       phantomLinesField,
       centerPhantomDecoField,
       centerConflictPlugin,
     ], (doc) => {
       setCenterDoc(doc);
-      updateConflictStates(doc);
+      const cv = centerView.current;
+      if (cv) setBlocks(cv.state.field(conflictBlocksField));
     });
+
+    const initialBlocks: ConflictBlock[] = parseConflictRanges(content.merged).map(r => ({
+      from: r.markerFrom,
+      to: Math.min(r.markerTo, content.merged.length),
+    }));
+    centerView.current.dispatch({ effects: setConflictBlocks.of(initialBlocks) });
+    setBlocks(initialBlocks);
 
     // Right pane
     rightView.current = makeReadonlyEditor(rightRef.current, content.theirs, [
@@ -227,8 +261,6 @@ export function ThreePaneEditor({
       sidePanePhantomDecoField,
       sidePanePlugin,
     ]);
-
-    updateConflictStates(content.merged);
 
     return () => {
       leftView.current?.destroy();
@@ -242,11 +274,25 @@ export function ThreePaneEditor({
     const cv = centerView.current;
     if (!cv) return;
 
-    const ranges: ConflictRange[] = parseConflictRanges(centerDoc).map((r, i) => ({
-      ...r,
-      idx: i,
-      status: conflictStateMap.get(i) ?? "unresolved",
-    }));
+    const ranges: ConflictRange[] = blockInfo.map((b, i) => {
+      if (b.status === "unresolved") {
+        const inner = parseConflictRanges(b.text)[0];
+        if (inner) {
+          return {
+            idx: i, status: "unresolved",
+            markerFrom: b.from + inner.markerFrom, markerTo: Math.min(b.from + inner.markerTo, b.to),
+            oursFrom: b.from + inner.oursFrom,     oursTo: b.from + inner.oursTo,
+            sepFrom: b.from + inner.sepFrom,
+            theirsFrom: b.from + inner.theirsFrom, theirsTo: b.from + inner.theirsTo,
+          };
+        }
+      }
+      return {
+        idx: i, status: b.status === "unresolved" ? "manual" : b.status,
+        markerFrom: b.from, markerTo: b.to,
+        oursFrom: b.from, oursTo: b.from, sepFrom: b.from, theirsFrom: b.from, theirsTo: b.from,
+      };
+    });
 
     cv.dispatch({
       effects: [
@@ -254,7 +300,7 @@ export function ThreePaneEditor({
         setPhantomLines.of(phantomData.centerPhantoms),
       ],
     });
-  }, [centerDoc, conflictStateMap, phantomData]);
+  }, [blockInfo, phantomData]);
 
   // ── Update side pane decorations ──────────────────────────────────────────
   useEffect(() => {
@@ -318,34 +364,62 @@ export function ThreePaneEditor({
     };
   }, []);
 
-  // ── Accept ours / theirs / both for conflict i ────────────────────────────
-  const acceptConflict = useCallback((conflictIdx: number, kind: "ours" | "theirs" | "both") => {
+  // ── Apply one side to conflict i (IntelliJ-style) ─────────────────────────
+  // First side applied replaces the marker block; applying the other side
+  // afterwards appends it below whatever the block holds by then.
+  const applySide = (cv: EditorView, idx: number, side: "ours" | "theirs"): boolean => {
+    const b  = cv.state.field(conflictBlocksField)[idx];
+    const ic = initialConflicts[idx];
+    if (!b || !ic) return false;
+
+    const text = (side === "ours" ? ic.oursLines : ic.theirsLines).join("\n");
+    const doc = cv.state.doc;
+    const blockText = doc.sliceString(b.from, b.to);
+
+    if (MARKER_RE.test(blockText)) {
+      // The block ends after the >>>>>>> line's newline; keep that newline
+      const insert = text && blockText.endsWith("\n") ? text + "\n" : text;
+      cv.dispatch({ changes: { from: b.from, to: b.to, insert } });
+    } else if (text) {
+      let insert: string;
+      if (blockText.endsWith("\n")) insert = text + "\n";
+      else if (blockText) insert = "\n" + text;
+      else if (b.to < doc.length) insert = text + "\n";
+      else insert = b.from > 0 && doc.sliceString(b.from - 1, b.from) !== "\n" ? "\n" + text : text;
+      cv.dispatch({ changes: { from: b.to, insert } });
+    }
+    return true;
+  };
+
+  // Accept (apply) or ignore one side of a conflict. Ignoring a side of a block
+  // that still has markers drops the markers (and both texts), leaving the
+  // other side available to accept or ignore.
+  const handleSide = useCallback((conflictIdx: number, side: "ours" | "theirs", action: "accept" | "ignore") => {
     const cv = centerView.current;
     if (!cv) return;
+    const before = cv.state.field(conflictBlocksField)[conflictIdx];
+    if (!before) return;
+    const wasUnresolved = MARKER_RE.test(cv.state.sliceDoc(before.from, before.to));
 
-    const ranges = cv.state.field(conflictRangesField);
-    const r = ranges[conflictIdx];
-    if (!r) return;
+    if (action === "accept") {
+      if (!applySide(cv, conflictIdx, side)) return;
+    } else if (wasUnresolved) {
+      cv.dispatch({ changes: { from: before.from, to: before.to, insert: "" } });
+    }
+    setApplied(prev => prev.map((a, i) =>
+      i === conflictIdx ? { ...a, [side]: action === "accept" ? "applied" : "ignored" } : a));
 
-    const ic = initialConflicts[conflictIdx];
-    if (!ic) return;
-
-    const oursContent   = ic.oursLines.join("\n");
-    const theirsContent = ic.theirsLines.join("\n");
-    const replacement   =
-      kind === "ours"   ? oursContent
-      : kind === "theirs" ? theirsContent
-      : [oursContent, theirsContent].filter(Boolean).join("\n");
-
-    const from = r.markerFrom;
-    const to   = Math.min(r.markerTo, cv.state.doc.length);
-
-    cv.dispatch({
-      changes: { from, to, insert: replacement },
-    });
-
-    // Auto-advance to next unresolved
-    goToConflict(conflictIdx + 1);
+    // After the first decision, move on to the next conflict still showing markers
+    if (wasUnresolved) {
+      const now = cv.state.field(conflictBlocksField);
+      for (let j = conflictIdx + 1; j < now.length; j++) {
+        if (MARKER_RE.test(cv.state.sliceDoc(now[j].from, now[j].to))) {
+          setActiveConflict(j);
+          cv.dispatch({ effects: EditorView.scrollIntoView(now[j].from, { y: "center" }) });
+          break;
+        }
+      }
+    }
   }, [initialConflicts]);
 
   // ── Navigate to conflict i ────────────────────────────────────────────────
@@ -381,21 +455,17 @@ export function ThreePaneEditor({
     }
   }, [activeConflict, total]);
 
-  // Accept all one side
+  // Accept all one side (only conflicts still showing markers)
   const acceptAll = (kind: "ours" | "theirs") => {
     const cv = centerView.current;
     if (!cv) return;
-
-    const ranges = [...cv.state.field(conflictRangesField)].reverse(); // apply back-to-front
-    for (const r of ranges) {
-      const idx = r.idx;
-      const ic = initialConflicts[idx];
-      if (!ic) continue;
-      const replacement = kind === "ours" ? ic.oursLines.join("\n") : ic.theirsLines.join("\n");
-      const from = r.markerFrom;
-      const to   = Math.min(r.markerTo, cv.state.doc.length);
-      cv.dispatch({ changes: { from, to, insert: replacement } });
+    const done: number[] = [];
+    const count = cv.state.field(conflictBlocksField).length;
+    for (let i = 0; i < count; i++) {
+      const b = cv.state.field(conflictBlocksField)[i];
+      if (MARKER_RE.test(cv.state.sliceDoc(b.from, b.to)) && applySide(cv, i, kind)) done.push(i);
     }
+    setApplied(prev => prev.map((a, i) => done.includes(i) ? { ...a, [kind]: "applied" } : a));
   };
 
   // ── Update undo/redo availability ─────────────────────────────────────────
@@ -429,20 +499,20 @@ export function ThreePaneEditor({
     return () => window.removeEventListener("keydown", h);
   }, [activeConflict, goToConflict, goToNextUnresolved]);
 
-  // ── Stage ─────────────────────────────────────────────────────────────────
+  // ── Done: write result, stage, parent moves to the next file ──────────────
   const stage = async () => {
     const cv = centerView.current;
-    if (!cv) return;
+    if (!cv || staging) return;
     const doc = cv.state.doc.toString();
 
-    if (doc.includes("<<<<<<<")) {
+    if (MARKER_RE.test(doc)) {
       toast.error("Unresolved conflict markers remain");
       return;
     }
     setStaging(true);
     try {
       await git.resolveConflict(repoPath, filePath, doc);
-      toast.success(`Staged: ${filePath}`);
+      toast.success(`Resolved: ${filePath}`);
       onStaged();
     } catch (e) {
       toast.error(String(e));
@@ -453,7 +523,18 @@ export function ThreePaneEditor({
 
   // ── Render ────────────────────────────────────────────────────────────────
 
-  const unresolvedTotal = parseConflictRanges(centerDoc).length;
+  const unresolvedTotal = total - resolvedCount;
+
+  // Ctrl/Cmd+Enter = Done
+  const stageRef = useRef(stage);
+  stageRef.current = stage;
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); stageRef.current(); }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
 
   return (
     <div className="flex flex-col h-full overflow-hidden font-mono">
@@ -509,9 +590,10 @@ export function ThreePaneEditor({
         </div>
 
         <button onClick={stage} disabled={!allDone || staging} data-testid="stage-btn"
+          title="Write the result, stage it and go to the next conflicted file (Ctrl/Cmd+Enter)"
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0">
           {staging && <Loader2 size={11} className="animate-spin" />}
-          {staging ? "Staging…" : "Stage File"}
+          {staging ? "Saving…" : <><CheckCircle size={11} /> Done</>}
         </button>
 
         <button onClick={onSkip}
@@ -537,10 +619,10 @@ export function ThreePaneEditor({
             <SidePaneOverlay
               paneView={leftView}
               conflicts={sideRanges.oursConflicts}
-              conflictStateMap={conflictStateMap}
+              applied={applied}
               side="ours"
               onActivate={setActiveConflict}
-              onAccept={acceptConflict}
+              onSide={handleSide}
             />
           </div>
 
@@ -555,10 +637,10 @@ export function ThreePaneEditor({
             <SidePaneOverlay
               paneView={rightView}
               conflicts={sideRanges.theirsConflicts}
-              conflictStateMap={conflictStateMap}
+              applied={applied}
               side="theirs"
               onActivate={setActiveConflict}
-              onAccept={acceptConflict}
+              onSide={handleSide}
             />
           </div>
         </div>
@@ -581,8 +663,8 @@ export function ThreePaneEditor({
         <span className="text-[10px] text-muted-foreground flex-1 text-right">
           {allDone
             ? total === 0
-              ? "No conflicts — click Stage File"
-              : "All resolved — click Stage File"
+              ? "No conflicts — click Done"
+              : "All resolved — click Done (Ctrl+Enter) for the next file"
             : `${unresolvedTotal} conflict${unresolvedTotal !== 1 ? "s" : ""} remaining`}
         </span>
       </div>
@@ -593,14 +675,14 @@ export function ThreePaneEditor({
 // ── Accept button overlaid on side panes ─────────────────────────────────────
 
 function SidePaneOverlay({
-  paneView, conflicts, conflictStateMap, side, onActivate, onAccept,
+  paneView, conflicts, applied, side, onActivate, onSide,
 }: {
   paneView: React.RefObject<EditorView | null>;
   conflicts: SidePaneConflict[];
-  conflictStateMap: Map<number, ConflictStatus>;
+  applied: Applied[];
   side: "ours" | "theirs";
   onActivate: (i: number) => void;
-  onAccept: (i: number, kind: "ours" | "theirs") => void;
+  onSide: (i: number, side: "ours" | "theirs", action: "accept" | "ignore") => void;
 }) {
   const [positions, setPositions] = useState<{ top: number; idx: number }[]>([]);
 
@@ -631,35 +713,67 @@ function SidePaneOverlay({
   return (
     <>
       {positions.map(({ top, idx }) => {
-        const status = conflictStateMap.get(idx) ?? "unresolved";
-        if (status !== "unresolved") {
+        const pos = { position: "absolute" as const, top, [isOurs ? "right" : "left"]: 0, zIndex: 10 };
+        const state = applied[idx]?.[side] ?? "pending";
+
+        // Decided sides show what was done; pending ones offer Accept / Ignore
+        if (state !== "pending") {
           return (
-            <div key={idx} style={{ position: "absolute", top, [isOurs ? "right" : "left"]: 0, zIndex: 10 }}>
-              <div className="px-1.5 py-0.5 bg-green-950/70 border border-green-700/20 text-[9px]">
-                <CheckCircle size={8} className="text-green-400" />
+            <div key={idx} style={pos} title={state === "applied" ? "Accepted" : "Ignored"}>
+              <div className={cn(
+                "px-1.5 py-0.5 border text-[9px]",
+                state === "applied" ? "bg-green-950/70 border-green-700/20" : "bg-secondary/70 border-border/40",
+              )}>
+                {state === "applied"
+                  ? <CheckCircle size={8} className="text-green-400" />
+                  : <X size={8} className="text-muted-foreground" />}
               </div>
             </div>
           );
         }
 
-        return (
+        const accept = (
           <button
-            key={idx}
-            style={{ position: "absolute", top, [isOurs ? "right" : "left"]: 0, zIndex: 10 }}
-            onClick={() => { onActivate(idx); onAccept(idx, side); }}
+            key="accept"
+            data-testid={`accept-${side}-${idx}`}
+            onClick={() => { onActivate(idx); onSide(idx, side, "accept"); }}
             title={isOurs ? "Accept Local (ours)" : "Accept Remote (theirs)"}
             className={cn(
-              "flex items-center gap-0.5 px-1.5 py-0.5 text-[9px] font-medium",
-              "bg-card/90 backdrop-blur shadow-sm border transition-colors",
+              "flex items-center gap-0.5 px-1.5 py-0.5 text-[9px] font-medium transition-colors",
               isOurs
-                ? "text-green-400 hover:text-green-200 hover:bg-green-900/60 border-green-700/30 rounded-br"
-                : "text-blue-400 hover:text-blue-200 hover:bg-blue-900/60 border-blue-700/30 rounded-bl",
+                ? "text-green-400 hover:text-green-200 hover:bg-green-900/60"
+                : "text-blue-400 hover:text-blue-200 hover:bg-blue-900/60",
             )}
           >
             {isOurs
               ? <><ChevronsRight size={9} /> Accept</>
               : <>Accept <ChevronsLeft size={9} /></>}
           </button>
+        );
+        const ignore = (
+          <button
+            key="ignore"
+            data-testid={`ignore-${side}-${idx}`}
+            onClick={() => { onActivate(idx); onSide(idx, side, "ignore"); }}
+            title={isOurs ? "Ignore Local (ours) — don't take anything from this side" : "Ignore Remote (theirs) — don't take anything from this side"}
+            className="flex items-center gap-0.5 px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground hover:text-red-300 hover:bg-red-900/40 transition-colors"
+          >
+            <X size={9} /> Ignore
+          </button>
+        );
+
+        return (
+          <div
+            key={idx}
+            style={pos}
+            className={cn(
+              "flex items-center bg-card/90 backdrop-blur shadow-sm border divide-x divide-border/40",
+              isOurs ? "border-green-700/30 rounded-br" : "border-blue-700/30 rounded-bl",
+            )}
+          >
+            {/* Ignore sits on the outer edge, Accept next to the result pane */}
+            {isOurs ? [ignore, accept] : [accept, ignore]}
+          </div>
         );
       })}
     </>

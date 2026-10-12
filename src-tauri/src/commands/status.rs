@@ -1,5 +1,5 @@
 use crate::git::types::{FileStatus, FileStatusKind};
-use git2::{IndexAddOption, Repository, ResetType, Status};
+use git2::{IndexAddOption, Repository, Status};
 
 fn apply_patch(repo_path: &str, patch: &str, reverse: bool) -> Result<(), String> {
     use std::io::Write;
@@ -120,10 +120,63 @@ pub async fn unstage_file(repo_path: String, file_path: String) -> Result<(), St
 pub async fn stage_all(repo_path: String) -> Result<(), String> {
     let repo = Repository::open(&repo_path).map_err(|e| e.message().to_string())?;
     let mut index = repo.index().map_err(|e| e.message().to_string())?;
+    // Conflicted files still hold <<<<<<< markers; staging them would mark the
+    // conflict resolved with the markers committed. They leave the conflicted
+    // state only through the resolver.
+    let conflicted: std::collections::HashSet<std::path::PathBuf> = index
+        .conflicts()
+        .map_err(|e| e.message().to_string())?
+        .filter_map(|c| c.ok())
+        .filter_map(|c| c.our.or(c.their).or(c.ancestor))
+        .filter_map(|e| String::from_utf8(e.path).ok().map(std::path::PathBuf::from))
+        .collect();
+    let mut skip_conflicted = |path: &std::path::Path, _spec: &[u8]| -> i32 {
+        if conflicted.contains(path) { 1 } else { 0 }
+    };
     index
-        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, Some(&mut skip_conflicted))
         .map_err(|e| e.message().to_string())?;
     index.write().map_err(|e| e.message().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git").args(args).current_dir(dir).output().unwrap().status.success();
+        assert!(ok || args[0] == "merge", "git {:?} failed", args);
+    }
+
+    /// Unstaging everything mid-merge must keep the merge in progress
+    #[tokio::test]
+    async fn unstage_all_keeps_merge_state() {
+        let dir = std::env::temp_dir().join(format!("gitcrab-unstage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "base"]);
+        git(&dir, &["checkout", "-qb", "other"]);
+        std::fs::write(dir.join("f.txt"), "theirs\n").unwrap();
+        git(&dir, &["commit", "-qam", "theirs"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("f.txt"), "ours\n").unwrap();
+        git(&dir, &["commit", "-qam", "ours"]);
+        git(&dir, &["merge", "other"]);
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        git(&dir, &["add", "f.txt"]);
+
+        unstage_all(dir.to_string_lossy().to_string()).await.unwrap();
+
+        assert!(dir.join(".git/MERGE_HEAD").exists(), "merge was aborted");
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "resolved\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[tauri::command]
@@ -135,8 +188,25 @@ pub async fn unstage_all(repo_path: String) -> Result<(), String> {
         .and_then(|h| h.peel_to_commit().ok());
 
     if let Some(commit) = head {
-        let obj = commit.as_object();
-        repo.reset(obj, ResetType::Mixed, None)
+        // Path-limited reset (`git reset -- <paths>`), not a whole-repo mixed
+        // reset: libgit2's git_reset also clears MERGE_HEAD/MERGE_MSG, which
+        // silently aborted an in-progress merge.
+        let staged: Vec<String> = repo
+            .statuses(None)
+            .map_err(|e| e.message().to_string())?
+            .iter()
+            .filter(|e| {
+                e.status().intersects(
+                    Status::INDEX_NEW | Status::INDEX_MODIFIED | Status::INDEX_DELETED
+                        | Status::INDEX_RENAMED | Status::INDEX_TYPECHANGE,
+                )
+            })
+            .filter_map(|e| e.path().map(str::to_string))
+            .collect();
+        if staged.is_empty() {
+            return Ok(());
+        }
+        repo.reset_default(Some(commit.as_object()), staged.iter())
             .map_err(|e| e.message().to_string())
     } else {
         // No commits yet — just clear the index
